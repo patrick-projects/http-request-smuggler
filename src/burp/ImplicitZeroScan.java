@@ -19,6 +19,8 @@ public class ImplicitZeroScan extends SmuggleScanBox {
     String lastConfirmedTechnique;
     String lastConfirmedGadget;
     boolean lastConfirmedOverH2;
+    Resp lastBaselineResp;
+    Resp lastPoisonedResp;
 
     ImplicitZeroScan(String name) {
         super(name);
@@ -141,6 +143,8 @@ public class ImplicitZeroScan extends SmuggleScanBox {
                 lastConfirmedTechnique = technique;
                 lastConfirmedGadget = gadget.payload;
                 lastConfirmedOverH2 = forceHTTP2;
+                lastBaselineResp = lastResp;
+                lastPoisonedResp = resp;
 
                 report("CL.0 desync: "+technique+"|"+gadget.payload, "HTTP Request Smuggler repeatedly issued the attached request. After "+i+ " attempts, it got a response that appears to have been poisoned by the body of the previous request. For further details and information on remediation, please refer to https://portswigger.net/research/browser-powered-desync-attacks", baseReq, lastResp, resp);
                 return true;

@@ -1275,6 +1275,7 @@ final class DesyncAgentDialog {
                 cfg.put(technique, true);
                 boolean hit = scan.doConfiguredScan(reqSnapshot.clone(), svc, cfg, gadgetLine);
                 if (hit) {
+                    displayScannerResponses(scan);
                     String repeaterNote = loadAndSendConfirmed(scan);
                     return "\n========================================\n"
                             + "DESYNC CONFIRMED via scanner fallback using technique '" + technique + "'"
@@ -1345,6 +1346,7 @@ final class DesyncAgentDialog {
                 cfg.put(technique, true);
                 boolean hit = scan.doConfiguredScan(h2req.clone(), svc, cfg, gadgetLine);
                 if (hit) {
+                    displayScannerResponses(scan);
                     String repeaterNote = loadAndSendConfirmed(scan);
                     return "\n========================================\n"
                             + "CL.0 CONFIRMED using technique '" + technique + "'"
@@ -2696,6 +2698,55 @@ final class DesyncAgentDialog {
             } else {
                 followUpResponseArea.setText(
                         formatResponseForTab("Follow-up response (request #2 on the pair connection)", followUp));
+            }
+        });
+    }
+
+    /**
+     * Populates the #1 attack and #2 follow-up response panes from the scanner's
+     * stored responses after a confirmed self-poison detection. The scanner sends
+     * the same attack repeatedly; "baseline" is the previous normal response and
+     * "poisoned" is the response that matched the smuggled gadget.
+     */
+    private void displayScannerResponses(ImplicitZeroScan scan) {
+        SwingUtilities.invokeLater(() -> {
+            if (scan.lastConfirmedAttack != null) {
+                attackResponseArea.setText(
+                        "Attack request (scanner self-poison mode)\n"
+                        + "The scanner sends the same attack repeatedly. The response below is\n"
+                        + "the POISONED response — it matched the smuggled gadget because the\n"
+                        + "previous attempt's body was parsed as a new request.\n"
+                        + "----------------------------------------\n"
+                        + (scan.lastPoisonedResp != null && !scan.lastPoisonedResp.failed()
+                            ? "HTTP status: " + scan.lastPoisonedResp.getStatus()
+                              + "\nBody size: " + respLen(scan.lastPoisonedResp) + " bytes\n"
+                              + "----------------------------------------\n"
+                              + respString(scan.lastPoisonedResp)
+                            : "(scanner confirmed but response object not available)"));
+            }
+            if (scan.lastBaselineResp != null || scan.lastPoisonedResp != null) {
+                StringBuilder sb = new StringBuilder();
+                sb.append("Scanner self-poison: baseline vs poisoned responses\n\n");
+                if (scan.lastBaselineResp != null && !scan.lastBaselineResp.failed()) {
+                    sb.append("--- NORMAL response (attempt before poisoning) ---\n");
+                    sb.append("HTTP status: ").append(scan.lastBaselineResp.getStatus())
+                      .append("\nBody size: ").append(respLen(scan.lastBaselineResp)).append(" bytes\n");
+                    sb.append("----------------------------------------\n");
+                    sb.append(truncate(respString(scan.lastBaselineResp), 3000));
+                } else {
+                    sb.append("--- NORMAL response ---\n(not available)\n");
+                }
+                sb.append("\n\n========================================\n\n");
+                if (scan.lastPoisonedResp != null && !scan.lastPoisonedResp.failed()) {
+                    sb.append("--- POISONED response (matched smuggled gadget) ---\n");
+                    sb.append("HTTP status: ").append(scan.lastPoisonedResp.getStatus())
+                      .append("\nBody size: ").append(respLen(scan.lastPoisonedResp)).append(" bytes\n");
+                    sb.append("----------------------------------------\n");
+                    sb.append(truncate(respString(scan.lastPoisonedResp), 3000));
+                } else {
+                    sb.append("--- POISONED response ---\n(not available)\n");
+                }
+                followUpResponseArea.setText(sb.toString());
             }
         });
     }
