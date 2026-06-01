@@ -36,8 +36,11 @@ import java.awt.Font;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 /**
  * Operator-facing "agent" for confirming and replicating a CL.0 desync finding.
@@ -83,6 +86,7 @@ final class DesyncAgentDialog {
     private final JTabbedPane tabs;
     private final JTextArea aiArea;
     private final JButton aiButton;
+    private final JButton suggestButton;
     private final JComboBox<String> providerCombo;
     private final JTextField ollamaModelField;
     private final JTextField ollamaEndpointField;
@@ -147,6 +151,7 @@ final class DesyncAgentDialog {
         this.tabs = new JTabbedPane();
         this.aiArea = readOnly();
         this.aiButton = new JButton("Ask AI agent");
+        this.suggestButton = new JButton("Suggest smuggle endpoints");
         this.providerCombo = new JComboBox<>(new String[]{PROVIDER_OLLAMA, PROVIDER_BURP});
         this.ollamaModelField = new JTextField(DEFAULT_OLLAMA_MODEL, 14);
         this.ollamaEndpointField = new JTextField(DEFAULT_OLLAMA_URL, 18);
@@ -305,6 +310,9 @@ final class DesyncAgentDialog {
         cfg.add(new JLabel("Endpoint:"));
         cfg.add(ollamaEndpointField);
         cfg.add(aiButton);
+        suggestButton.setToolTipText("Ask local Ollama to rank high-impact smuggled GET lines from "
+                + "proxy/site-map traffic for this host (requires Local Ollama provider).");
+        cfg.add(suggestButton);
 
         // Default to the local Ollama provider; Burp AI is kept for later.
         providerCombo.setSelectedItem(PROVIDER_OLLAMA);
@@ -312,6 +320,7 @@ final class DesyncAgentDialog {
             boolean ollama = !PROVIDER_BURP.equals(providerCombo.getSelectedItem());
             ollamaModelField.setEnabled(ollama);
             ollamaEndpointField.setEnabled(ollama);
+            suggestButton.setEnabled(ollama);
             if (!ollama && !isAiEnabled()) {
                 aiButton.setToolTipText("Burp AI is not enabled yet — switch to Local Ollama.");
             } else {
@@ -321,9 +330,12 @@ final class DesyncAgentDialog {
         providerCombo.addActionListener(e -> syncProvider.run());
         syncProvider.run();
         aiButton.addActionListener(e -> runAgent());
+        suggestButton.addActionListener(e -> runEndpointSuggestion());
 
         aiArea.setText("Pick a provider and click \"Ask AI agent\" to generate a tailored explanation "
                 + "and step-by-step replication walkthrough for this finding.\n\n"
+                + "Or click \"Suggest smuggle endpoints\" (Ollama) to rank high-impact smuggled GET lines "
+                + "from Burp proxy/site-map traffic for this host.\n\n"
                 + "Default provider is your local Ollama (" + DEFAULT_OLLAMA_MODEL + " at "
                 + DEFAULT_OLLAMA_URL + "). The original request, response and generated PoC are sent to "
                 + "that local server only.\n\n"
@@ -2502,6 +2514,322 @@ final class DesyncAgentDialog {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    private void runEndpointSuggestion() {
+        if (!PROVIDER_OLLAMA.equals(providerCombo.getSelectedItem())) {
+            aiArea.setText("Endpoint suggestions use your local Ollama instance. Switch the provider to \""
+                    + PROVIDER_OLLAMA + "\" and try again.");
+            tabs.setSelectedIndex(tabs.indexOfTab("AI analysis"));
+            return;
+        }
+        if (service == null) {
+            aiArea.setText("Cannot suggest endpoints: no HTTP service for this request.");
+            return;
+        }
+
+        final String model = ollamaModelField.getText().trim();
+        final String endpoint = ollamaEndpointField.getText().trim();
+        final long start = System.currentTimeMillis();
+        final DesyncRepro.Type type = repro == null ? DesyncRepro.Type.CL_0 : repro.type;
+        final String technique = repro == null ? "" : repro.technique;
+        final String currentLine = smuggledLineField.getText() == null ? "" : smuggledLineField.getText().trim();
+
+        suggestButton.setEnabled(false);
+        aiButton.setEnabled(false);
+        tabs.setSelectedIndex(tabs.indexOfTab("AI analysis"));
+        aiArea.setText("[gathering proxy history and site map for " + service.host() + "...]\n\n");
+        startElapsedTimer(start, "Ollama (endpoint suggest)");
+
+        new SwingWorker<String, String>() {
+            @Override
+            protected String doInBackground() {
+                try {
+                    String siteContext = gatherSiteContext();
+                    final String host = service.host();
+                    SwingUtilities.invokeLater(() -> aiArea.setText(
+                            "Analyzed proxy + site map for " + host + " — asking " + model
+                                    + " for ranked smuggle lines...\n\n"));
+                    String system = endpointSuggestionSystemPrompt();
+                    String user = buildEndpointSuggestionUserPrompt(siteContext, type, technique, currentLine);
+                    return OllamaClient.chatStream(endpoint, model, system, user, 600,
+                            token -> publish(token));
+                } catch (Throwable t) {
+                    String detail = t.getMessage() == null ? t.toString() : t.getMessage();
+                    return "\n\nOllama request failed: " + detail + "\n\n"
+                            + "Checklist:\n"
+                            + "  - Is Ollama running?            ollama serve\n"
+                            + "  - Is the model pulled?          ollama pull " + model + "\n"
+                            + "  - Is the endpoint reachable?     " + endpoint + "\n"
+                            + "  - Browse the target in Burp first so proxy/site map have paths.";
+                }
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                for (String chunk : chunks) {
+                    aiArea.append(chunk);
+                }
+                aiArea.setCaretPosition(aiArea.getDocument().getLength());
+            }
+
+            @Override
+            protected void done() {
+                stopElapsedTimer();
+                long secs = (System.currentTimeMillis() - start) / 1000;
+                try {
+                    String content = get();
+                    if (content != null && content.contains("Ollama request failed")) {
+                        aiArea.append(content);
+                        setStatus("Endpoint suggestion failed.");
+                    } else {
+                        aiArea.append("\n\n[done in " + secs
+                                + "s — copy a GET line into \"Smuggled request line\", then Regenerate / Run test]");
+                        setStatus("Endpoint suggestions ready (" + secs + "s).");
+                    }
+                    aiArea.setCaretPosition(aiArea.getDocument().getLength());
+                } catch (Exception ex) {
+                    aiArea.append("\n\nRequest failed: " + ex.getMessage());
+                    setStatus("Endpoint suggestion failed.");
+                } finally {
+                    suggestButton.setEnabled(true);
+                    aiButton.setEnabled(true);
+                }
+            }
+        }.execute();
+    }
+
+    /**
+     * Collects unique paths observed for {@link #service}'s host from proxy history and site map.
+     * Read-only; capped for Ollama context size.
+     */
+    private String gatherSiteContext() {
+        if (service == null) {
+            return "(no target host)";
+        }
+        final String targetHost = service.host();
+        final int maxPaths = 100;
+        final int maxChars = 4000;
+        LinkedHashMap<String, PathObservation> paths = new LinkedHashMap<>();
+
+        try {
+            List<ProxyHttpRequestResponse> history = api.proxy().history();
+            for (int i = history.size() - 1; i >= 0 && paths.size() < maxPaths * 2; i--) {
+                ProxyHttpRequestResponse phrr = history.get(i);
+                if (phrr == null || phrr.finalRequest() == null) {
+                    continue;
+                }
+                observePath(paths, phrr.finalRequest(), phrr.originalResponse(), targetHost);
+            }
+        } catch (Throwable ignored) {
+            // proxy history optional
+        }
+
+        try {
+            List<HttpRequestResponse> siteItems = api.siteMap().requestResponses();
+            for (int i = siteItems.size() - 1; i >= 0 && paths.size() < maxPaths * 2; i--) {
+                HttpRequestResponse rr = siteItems.get(i);
+                if (rr == null || rr.request() == null) {
+                    continue;
+                }
+                observePath(paths, rr.request(), rr.response(), targetHost);
+            }
+        } catch (Throwable ignored) {
+            // site map optional
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Unique paths for host ").append(targetHost).append(" (")
+                .append(paths.size()).append(" entries, from proxy + site map):\n\n");
+        int count = 0;
+        for (PathObservation obs : paths.values()) {
+            if (count >= maxPaths) {
+                sb.append("... (truncated at ").append(maxPaths).append(" paths)\n");
+                break;
+            }
+            sb.append(obs.format()).append('\n');
+            count++;
+        }
+        if (paths.isEmpty()) {
+            sb.append("(no in-scope traffic found — browse the target through Burp proxy first)\n");
+        }
+        String out = sb.toString();
+        if (out.length() > maxChars) {
+            return out.substring(0, maxChars) + "\n...[site context truncated]...";
+        }
+        return out;
+    }
+
+    private void observePath(Map<String, PathObservation> paths, HttpRequest req, HttpResponse resp,
+                             String targetHost) {
+        if (req == null || req.httpService() == null) {
+            return;
+        }
+        if (!targetHost.equalsIgnoreCase(req.httpService().host())) {
+            return;
+        }
+        String method = req.method() == null ? "GET" : req.method().trim().toUpperCase(Locale.ROOT);
+        String fullPath = req.path() == null ? "/" : req.path();
+        int q = fullPath.indexOf('?');
+        String pathOnly = q >= 0 ? fullPath.substring(0, q) : fullPath;
+        if (pathOnly.isEmpty()) {
+            pathOnly = "/";
+        }
+        String key = method + " " + pathOnly;
+        PathObservation obs = paths.get(key);
+        if (obs == null) {
+            obs = new PathObservation(method, pathOnly);
+            paths.put(key, obs);
+        }
+        boolean hasCookie = false;
+        for (HttpHeader h : req.headers()) {
+            if ("Cookie".equalsIgnoreCase(h.name()) && h.value() != null && !h.value().trim().isEmpty()) {
+                hasCookie = true;
+                break;
+            }
+        }
+        obs.hasCookie = obs.hasCookie || hasCookie;
+        if (resp != null) {
+            try {
+                obs.status = resp.statusCode();
+            } catch (Throwable ignored) {
+                // ignore
+            }
+            String ct = resp.headerValue("Content-Type");
+            if (ct != null && !ct.isEmpty()) {
+                obs.contentType = ct;
+            }
+            String loc = resp.headerValue("Location");
+            if (loc != null && !loc.isEmpty()) {
+                obs.redirect = true;
+            }
+            String setCookie = resp.headerValue("Set-Cookie");
+            if (setCookie != null && !setCookie.isEmpty()) {
+                obs.setsCookie = true;
+            }
+        }
+        obs.noteKeywords();
+    }
+
+    private static final class PathObservation {
+        final String method;
+        final String path;
+        int status;
+        String contentType = "";
+        boolean hasCookie;
+        boolean redirect;
+        boolean setsCookie;
+        boolean json;
+        boolean html;
+        boolean keywordHit;
+
+        PathObservation(String method, String path) {
+            this.method = method;
+            this.path = path;
+        }
+
+        void noteKeywords() {
+            String lower = (method + " " + path).toLowerCase(Locale.ROOT);
+            String[] needles = {
+                    "token", "auth", "admin", "account", "transfer", "payment", "user",
+                    "profile", "session", "api", "graphql", "oauth", "sso", "vam", "transaction"
+            };
+            for (String n : needles) {
+                if (lower.contains(n)) {
+                    keywordHit = true;
+                    break;
+                }
+            }
+            if (contentType != null) {
+                String ct = contentType.toLowerCase(Locale.ROOT);
+                json = ct.contains("json");
+                html = ct.contains("html");
+            }
+        }
+
+        String format() {
+            noteKeywords();
+            StringBuilder sb = new StringBuilder();
+            sb.append(method).append(' ').append(path);
+            if (status > 0) {
+                sb.append(" | HTTP ").append(status);
+            }
+            if (!contentType.isEmpty()) {
+                sb.append(" | Content-Type: ").append(contentType);
+            }
+            List<String> flags = new ArrayList<>();
+            if (hasCookie) {
+                flags.add("Cookie on request");
+            }
+            if (setsCookie) {
+                flags.add("Set-Cookie");
+            }
+            if (redirect) {
+                flags.add("redirect");
+            }
+            if (json) {
+                flags.add("JSON");
+            }
+            if (html) {
+                flags.add("HTML");
+            }
+            if (keywordHit) {
+                flags.add("sensitive-path keyword");
+            }
+            if (!flags.isEmpty()) {
+                sb.append(" | ").append(String.join(", ", flags));
+            }
+            return sb.toString();
+        }
+    }
+
+    private static String endpointSuggestionSystemPrompt() {
+        return "You are an expert in HTTP request smuggling and desync attacks (CL.0, CL.TE, TE.CL), "
+                + "familiar with PortSwigger research. A penetration tester has confirmed or is "
+                + "investigating a desync on a specific host. Your job is to recommend the best "
+                + "SMUGGLED REQUEST LINES to embed in a CL.0 (or similar) proof-of-concept.\n\n"
+                + "Rank endpoints from the supplied site map by smuggling impact:\n"
+                + "1. Sensitive data in the smuggled response (tokens, PII, OAuth JSON, account APIs).\n"
+                + "2. State-changing GETs if any exist (rare but critical).\n"
+                + "3. Different Content-Type than the outer/trigger request (clearer desync witness).\n"
+                + "4. Authenticated-only routes (Cookie required on observed traffic).\n"
+                + "5. Distinctive responses (not generic 404/302 to login).\n\n"
+                + "Output a numbered list of 5–10 suggestions. For EACH item give:\n"
+                + "- An exact smuggled line: GET /path HTTP/1.1 (or the correct method if not GET)\n"
+                + "- One sentence rationale tied to the list above.\n\n"
+                + "Only suggest paths that appear in the site map. Do not invent paths. Prefer GET for "
+                + "smuggling witnesses unless POST is clearly more impactful. Mention if the tester "
+                + "should use favicon.ico or a canary only as a last resort for witness-only PoCs.";
+    }
+
+    private String buildEndpointSuggestionUserPrompt(String siteContext, DesyncRepro.Type type,
+                                                     String technique, String currentSmuggledLine) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Target: ").append(serviceDescription()).append('\n');
+        sb.append("Desync class: ").append(type == null ? "CL.0" : type.label).append('\n');
+        if (technique != null && !technique.isEmpty()) {
+            sb.append("Confirmed or suspected CL permutation: ").append(technique).append('\n');
+        }
+        sb.append("Current smuggled line in the agent UI: ")
+                .append(currentSmuggledLine.isEmpty() ? "(default favicon or empty)" : currentSmuggledLine)
+                .append('\n');
+        sb.append("Session cookie in agent: ")
+                .append(cookieField.getText() != null && !cookieField.getText().trim().isEmpty()
+                        ? "yes" : "no").append("\n\n");
+
+        sb.append("OUTER / TRIGGER REQUEST (the request being smuggled inside):\n");
+        sb.append("```\n").append(truncate(decode(workingRequest), 2500)).append("\n```\n\n");
+        if (responseBytes != null && responseBytes.length > 0) {
+            sb.append("OUTER RESPONSE (abbreviated):\n");
+            sb.append("```\n").append(truncate(decode(responseBytes), 1200)).append("\n```\n\n");
+        }
+
+        sb.append("SITE MAP / PROXY OBSERVATIONS:\n");
+        sb.append("```\n").append(siteContext).append("\n```\n");
+
+        sb.append("\nSuggest ranked smuggled request lines for maximum impact and clear desync proof. "
+                + "Format each line exactly as it should appear in the \"Smuggled request line\" field.");
+        return sb.toString();
     }
 
     private void runAgent() {
