@@ -603,6 +603,11 @@ final class DesyncAgentDialog {
                     IHttpService svc = Utilities.helpers.buildHttpService(
                             service.host(), service.port(), service.secure());
 
+                    // Warmup: prime the connection pool so the first real attempt
+                    // doesn't land on a cold backend / WAF challenge.
+                    publish("Warmup: priming connection...");
+                    tryBaseline(svc, followBytes);
+
                     publish("Baseline: sending the follow-up request on its own...");
                     Resp base1 = tryBaseline(svc, followBytes);
                     capturedBaseline[0] = base1;
@@ -619,58 +624,84 @@ final class DesyncAgentDialog {
                             + respLen(base1) + " bytes" + (stable ? " (stable)" : " (UNSTABLE — results may be noisy)"));
 
                     int attempts = SINGLE_CONNECTION_ATTEMPTS;
-                    int singleConn = 0;
-                    int poisoned = 0;
+                    int totalSingleConn = 0;
+                    int totalPoisoned = 0;
+                    int totalSkipped = 0;
                     Resp evidence = null;
-                    publish("Running " + attempts + " single-connection attempts (attack -> follow-up)...");
-                    for (int i = 1; i <= attempts; i++) {
-                        if (stopRequested()) {
-                            return stoppedByUserMessage("test");
-                        }
-                        TurboHelper helper = new TurboHelper(svc, true);
-                        helper.queue(attackBytes);
-                        helper.queue(followBytes);
-                        List<Resp> results = helper.waitFor();
-                        int conns = helper.getConnectionCount();
-                        if (results == null || results.size() < 2 || results.get(1) == null
-                                || results.get(1).failed()) {
-                            publish("  attempt " + i + ": no usable follow-up response, skipping.");
-                            continue;
-                        }
-                        if (conns > 1) {
-                            publish("  attempt " + i + ": front-end used " + conns
-                                    + " connections (not single) — inconclusive for this attempt.");
-                            continue;
-                        }
-                        singleConn++;
-                        Resp attackR = results.get(0);
-                        Resp p = results.get(1);
-                        if (capturedAttack[0] == null && attackR != null && !attackR.failed()) {
-                            capturedAttack[0] = attackR;
-                            capturedFollow[0] = p;
-                        }
-                        if (!similar(p, base1)) {
-                            poisoned++;
-                            if (evidence == null) {
-                                evidence = p;
+
+                    // Up to 2 rounds: if first round gets 0 hits but many attempts
+                    // were wasted (multi-conn / failures), run a second pass.
+                    for (int round = 1; round <= 2; round++) {
+                        if (round == 2) {
+                            if (totalPoisoned > 0 || totalSkipped < 2) {
+                                break;
                             }
-                            capturedAttack[0] = attackR;
-                            capturedFollow[0] = p;
-                            publish("  attempt " + i + ": FOLLOW-UP CHANGED — HTTP " + base1.getStatus()
-                                    + " -> " + p.getStatus() + ", " + respLen(base1) + " -> " + respLen(p)
-                                    + " bytes  [desync signal]");
-                        } else {
-                            publish("  attempt " + i + ": follow-up unchanged (HTTP " + p.getStatus() + ").");
+                            // Refresh baseline before retry — target may have drifted.
+                            publish("\nRetrying: " + totalSkipped + " of " + attempts
+                                    + " attempts were unusable. Refreshing baseline...");
+                            Resp freshBase = tryBaseline(svc, followBytes);
+                            if (freshBase != null && !freshBase.failed()) {
+                                base1 = freshBase;
+                                capturedBaseline[0] = freshBase;
+                                publish("Refreshed baseline: HTTP " + base1.getStatus()
+                                        + ", " + respLen(base1) + " bytes");
+                            }
+                            totalSkipped = 0;
+                        }
+
+                        publish((round == 1 ? "Running " : "Round 2: running ") + attempts
+                                + " single-connection attempts (attack -> follow-up)...");
+                        for (int i = 1; i <= attempts; i++) {
+                            if (stopRequested()) {
+                                return stoppedByUserMessage("test");
+                            }
+                            TurboHelper helper = new TurboHelper(svc, true);
+                            helper.queue(attackBytes);
+                            helper.queue(followBytes);
+                            List<Resp> results = helper.waitFor();
+                            int conns = helper.getConnectionCount();
+                            if (results == null || results.size() < 2 || results.get(1) == null
+                                    || results.get(1).failed()) {
+                                totalSkipped++;
+                                publish("  attempt " + i + ": no usable follow-up response, skipping.");
+                                continue;
+                            }
+                            if (conns > 1) {
+                                totalSkipped++;
+                                publish("  attempt " + i + ": front-end used " + conns
+                                        + " connections (not single) — retrying.");
+                                continue;
+                            }
+                            totalSingleConn++;
+                            Resp attackR = results.get(0);
+                            Resp p = results.get(1);
+                            if (capturedAttack[0] == null && attackR != null && !attackR.failed()) {
+                                capturedAttack[0] = attackR;
+                                capturedFollow[0] = p;
+                            }
+                            if (!similar(p, base1)) {
+                                totalPoisoned++;
+                                if (evidence == null) {
+                                    evidence = p;
+                                }
+                                capturedAttack[0] = attackR;
+                                capturedFollow[0] = p;
+                                publish("  attempt " + i + ": FOLLOW-UP CHANGED — HTTP " + base1.getStatus()
+                                        + " -> " + p.getStatus() + ", " + respLen(base1) + " -> " + respLen(p)
+                                        + " bytes  [desync signal]");
+                            } else {
+                                publish("  attempt " + i + ": follow-up unchanged (HTTP " + p.getStatus() + ").");
+                            }
                         }
                     }
 
                     StringBuilder verdict = new StringBuilder("\n========================================\n");
-                    if (singleConn == 0) {
+                    if (totalSingleConn == 0) {
                         verdict.append("INCONCLUSIVE — the front-end never kept both requests on one\n")
                                 .append("connection, so a desync cannot be demonstrated this way. The target\n")
                                 .append("may not reuse connections, or may require HTTP/2.\n");
-                    } else if (poisoned > 0) {
-                        verdict.append("DESYNC CONFIRMED (").append(poisoned).append("/").append(singleConn)
+                    } else if (totalPoisoned > 0) {
+                        verdict.append("DESYNC CONFIRMED (").append(totalPoisoned).append("/").append(totalSingleConn)
                                 .append(" single-connection attempts).\n")
                                 .append("The follow-up response was poisoned by the smuggled request\n")
                                 .append("(").append(smuggledLine).append("). The attack + follow-up shown in the\n")
@@ -686,7 +717,7 @@ final class DesyncAgentDialog {
                             verdict.append(truncate(respString(evidence), 1200));
                         }
                     } else {
-                        verdict.append("NOT OBSERVED in ").append(singleConn)
+                        verdict.append("NOT OBSERVED in ").append(totalSingleConn)
                                 .append(" single-connection attempts.\n")
                                 .append("The follow-up response never changed. The target may not be\n")
                                 .append("vulnerable to ").append(label).append(", or it needs a different smuggled\n")
@@ -781,6 +812,11 @@ final class DesyncAgentDialog {
                     // Follow-up is independent of the smuggled gadget/type, so baseline once.
                     byte[] followBytes = DesyncRepro.build(DesyncRepro.Type.CL_0, reqSnapshot,
                             DesyncRepro.DEFAULT_SMUGGLED_LINE, null).followUpRequest;
+
+                    // Warmup: prime the connection pool.
+                    publish("Warmup: priming connection...");
+                    tryBaseline(svc, followBytes);
+
                     publish("Baseline: sending the follow-up request on its own...");
                     Resp base1 = tryBaseline(svc, followBytes);
                     if (base1 == null) {
@@ -806,6 +842,7 @@ final class DesyncAgentDialog {
 
                     int attemptsPerCombo = SINGLE_CONNECTION_ATTEMPTS;
                     int comboCount = 0;
+                    int baselineRefreshCounter = 0;
                     for (DesyncRepro.Type type : orderedTypes(primary)) {
                         if (stopRequested()) {
                             return stoppedByUserMessage("auto-sweep");
@@ -821,6 +858,18 @@ final class DesyncAgentDialog {
                                     return stoppedByUserMessage("auto-sweep");
                                 }
                                 comboCount++;
+
+                                // Refresh baseline every 6 combos to catch response drift.
+                                baselineRefreshCounter++;
+                                if (baselineRefreshCounter >= 6) {
+                                    baselineRefreshCounter = 0;
+                                    Resp freshBase = tryBaseline(svc, followBytes);
+                                    if (freshBase != null && !freshBase.failed()) {
+                                        base1 = freshBase;
+                                        sweepBaseline[0] = freshBase;
+                                    }
+                                }
+
                                 String desc = type.label
                                         + (type == DesyncRepro.Type.CL_0 ? " [" + technique + "]" : "")
                                         + " smuggling '" + gadget + "'";
@@ -830,6 +879,7 @@ final class DesyncAgentDialog {
 
                                 int singleConn = 0;
                                 int poisoned = 0;
+                                int skipped = 0;
                                 Resp evidence = null;
                                 for (int i = 1; i <= attemptsPerCombo; i++) {
                                     if (stopRequested()) {
@@ -842,6 +892,7 @@ final class DesyncAgentDialog {
                                     int conns = helper.getConnectionCount();
                                     if (results == null || results.size() < 2 || results.get(1) == null
                                             || results.get(1).failed() || conns > 1) {
+                                        skipped++;
                                         continue;
                                     }
                                     singleConn++;
@@ -854,6 +905,33 @@ final class DesyncAgentDialog {
                                         }
                                         sweepAttack[0] = attackR;
                                         sweepFollow[0] = p;
+                                    }
+                                }
+
+                                // Bonus attempts if most were wasted on failures/multi-conn.
+                                if (poisoned == 0 && skipped >= 3 && singleConn < attemptsPerCombo / 2) {
+                                    publish("  (" + skipped + " wasted — running " + skipped + " bonus attempts)");
+                                    for (int i = 0; i < skipped && i < attemptsPerCombo; i++) {
+                                        if (stopRequested()) {
+                                            return stoppedByUserMessage("auto-sweep");
+                                        }
+                                        TurboHelper helper = new TurboHelper(svc, true);
+                                        helper.queue(attackBytes);
+                                        helper.queue(candidate.followUpRequest);
+                                        List<Resp> results = helper.waitFor();
+                                        int conns = helper.getConnectionCount();
+                                        if (results == null || results.size() < 2 || results.get(1) == null
+                                                || results.get(1).failed() || conns > 1) {
+                                            continue;
+                                        }
+                                        singleConn++;
+                                        Resp p = results.get(1);
+                                        if (!similar(p, base1)) {
+                                            poisoned++;
+                                            if (evidence == null) evidence = p;
+                                            sweepAttack[0] = results.get(0);
+                                            sweepFollow[0] = p;
+                                        }
                                     }
                                 }
 

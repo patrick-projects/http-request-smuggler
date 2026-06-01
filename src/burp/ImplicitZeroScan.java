@@ -103,6 +103,7 @@ public class ImplicitZeroScan extends SmuggleScanBox {
         boolean badFirstStatus = false;
         Resp lastResp = null;
 
+        int consecutiveFailures = 0;
         for (int i=0; i<attempts; i++) {
             smuggle = String.format("%s\r\nX-"+justBodyReflectionCanary+": ", gadget.payload);
             byte[] attack = Utilities.setBody(req, smuggle);
@@ -117,8 +118,13 @@ public class ImplicitZeroScan extends SmuggleScanBox {
             }
 
             if (resp.failed()) {
-                return false;
+                consecutiveFailures++;
+                if (consecutiveFailures >= 3) {
+                    return false;
+                }
+                continue;
             }
+            consecutiveFailures = 0;
 
             if (gadget.worked(resp)) {
                 if ("wrtztrw".equals(gadget.payload) && Utilities.contains(resp, justBodyReflectionCanary) ) {
