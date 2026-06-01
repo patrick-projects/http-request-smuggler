@@ -1444,7 +1444,8 @@ final class DesyncAgentDialog {
         appendTest("\n--- Continuous spray (Burp) ---\n" + cookieNote);
         appendTest(h2
                 ? "Mode: HTTP/2 via Burp (each attack appears in Proxy history)."
-                : "Mode: HTTP/1.1 single-connection spray + periodic self-check.");
+                : "Mode: HTTP/1.1 single-connection spray + periodic self-check.\n"
+                + "(Will auto-switch to HTTP/2 if HTTP/1.1 fails repeatedly.)");
         appendTest("Click 'Stop spraying' when done. Browse the same host in your browser (through Burp).\n");
 
         sprayWorker = new SwingWorker<Void, String>() {
@@ -1452,6 +1453,7 @@ final class DesyncAgentDialog {
             int errors = 0;
             int hits = 0;
             int cycle = 0;
+            boolean useH2 = h2;
             Resp baseline;
             int baselineStatus;
             int baselineLen;
@@ -1463,11 +1465,18 @@ final class DesyncAgentDialog {
                     IHttpService svc = Utilities.helpers.buildHttpService(
                             service.host(), service.port(), service.secure());
 
-                    if (!h2) {
+                    if (!useH2) {
                         publish("Measuring baseline follow-up...");
                         baseline = tryBaseline(svc, followBytes);
                         if (baseline == null) {
-                            publish("WARNING: follow-up baseline failed — self-check disabled.");
+                            // TurboHelper can't reach — try HTTP/2 auto-detect.
+                            if (originalReachable(svc)) {
+                                publish("HTTP/1.1 baseline failed but target is reachable — "
+                                        + "switching to HTTP/2 spray mode.");
+                                useH2 = true;
+                            } else {
+                                publish("WARNING: follow-up baseline failed — self-check disabled.");
+                            }
                         } else {
                             baselineStatus = baseline.getStatus();
                             baselineLen = respLen(baseline);
@@ -1478,8 +1487,18 @@ final class DesyncAgentDialog {
 
                     while (!sprayStopRequested && !Utilities.unloaded.get()) {
                         cycle++;
+
+                        // Auto-switch to HTTP/2 if HTTP/1.1 spraying is all errors.
+                        if (!useH2 && cycle == 10 && sprayed == 0 && errors >= 8) {
+                            if (originalReachable(svc)) {
+                                publish("All HTTP/1.1 spray attempts failed — auto-switching to HTTP/2.");
+                                useH2 = true;
+                                errors = 0;
+                            }
+                        }
+
                         try {
-                            if (h2) {
+                            if (useH2) {
                                 Resp r = HTTP2Scan.h2request(svc, attackBytes.clone(), true);
                                 if (r.failed()) {
                                     errors++;
@@ -1498,7 +1517,7 @@ final class DesyncAgentDialog {
                             errors++;
                         }
 
-                        if (!h2 && baseline != null && cycle % 4 == 0) {
+                        if (!useH2 && baseline != null && cycle % 4 == 0) {
                             try {
                                 TurboHelper helper = new TurboHelper(svc, true);
                                 helper.queue(attackBytes);
@@ -1520,7 +1539,7 @@ final class DesyncAgentDialog {
                             }
                         }
 
-                        if (h2 && technique != null && !technique.isEmpty() && cycle % 12 == 0) {
+                        if (useH2 && technique != null && !technique.isEmpty() && cycle % 12 == 0) {
                             publish("Re-checking desync with technique '" + technique + "'...");
                             try {
                                 byte[] h2req = workingRequest.clone();
