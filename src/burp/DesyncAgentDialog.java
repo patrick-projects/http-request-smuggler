@@ -10,6 +10,7 @@ import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
+import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -220,6 +221,10 @@ final class DesyncAgentDialog {
         applyCookieBtn.setToolTipText("Inject this cookie into the attack and follow-up requests");
         applyCookieBtn.addActionListener(e -> applyCookie());
         session.add(applyCookieBtn);
+        JButton refreshCookieBtn = new JButton("Refresh from proxy");
+        refreshCookieBtn.setToolTipText("Grab the latest Cookie header for this host from Burp proxy history");
+        refreshCookieBtn.addActionListener(e -> refreshCookieFromProxy());
+        session.add(refreshCookieBtn);
         JButton validateBtn = new JButton("Validate session");
         validateBtn.setToolTipText("Send the request live with this cookie and check whether the session is still valid");
         validateBtn.addActionListener(e -> validateSession());
@@ -403,6 +408,61 @@ final class DesyncAgentDialog {
                     + "session cookie in the Cookie field above if the endpoint needs auth.";
         }
         return "Session: applying Cookie from the field (" + cookie.length() + " chars) to all requests.";
+    }
+
+    private void refreshCookieFromProxy() {
+        final String targetHost = service == null ? null : service.host();
+        if (targetHost == null || targetHost.isEmpty()) {
+            setSessionStatus("Cannot refresh: no host for this request.", true);
+            return;
+        }
+        setSessionStatus("Scanning proxy history for " + targetHost + "...", false);
+        new SwingWorker<String, Void>() {
+            @Override
+            protected String doInBackground() {
+                try {
+                    List<ProxyHttpRequestResponse> history = api.proxy().history();
+                    // Walk backwards (newest first) to find the latest Cookie for this host.
+                    for (int i = history.size() - 1; i >= 0; i--) {
+                        ProxyHttpRequestResponse entry = history.get(i);
+                        if (entry == null || entry.finalRequest() == null) continue;
+                        HttpRequest req = entry.finalRequest();
+                        if (req.httpService() == null) continue;
+                        if (!targetHost.equalsIgnoreCase(req.httpService().host())) continue;
+                        // Look for a Cookie header.
+                        for (HttpHeader h : req.headers()) {
+                            if ("Cookie".equalsIgnoreCase(h.name())) {
+                                String val = h.value();
+                                if (val != null && !val.trim().isEmpty()) {
+                                    return val.trim();
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable t) {
+                    return null;
+                }
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    String cookie = get();
+                    if (cookie != null && !cookie.isEmpty()) {
+                        cookieField.setText(cookie);
+                        applyCookie();
+                        setSessionStatus("Cookie refreshed from proxy history (" + cookie.length()
+                                + " chars). Click Validate to check.", false);
+                        setStatus("Cookie updated from proxy history.");
+                    } else {
+                        setSessionStatus("No Cookie found for " + targetHost + " in proxy history.", true);
+                    }
+                } catch (Exception ex) {
+                    setSessionStatus("Failed to scan proxy history: " + ex.getMessage(), true);
+                }
+            }
+        }.execute();
     }
 
     private void validateSession() {
@@ -655,9 +715,10 @@ final class DesyncAgentDialog {
                             if (stopRequested()) {
                                 return stoppedByUserMessage("test");
                             }
+                            byte[] bustedFollow = Utilities.addCacheBuster(followBytes, null);
                             TurboHelper helper = new TurboHelper(svc, true);
                             helper.queue(attackBytes);
-                            helper.queue(followBytes);
+                            helper.queue(bustedFollow);
                             List<Resp> results = helper.waitFor();
                             int conns = helper.getConnectionCount();
                             if (results == null || results.size() < 2 || results.get(1) == null
@@ -838,7 +899,10 @@ final class DesyncAgentDialog {
                     gadgetSet.add(DesyncRepro.DEFAULT_SMUGGLED_LINE);
                     gadgetSet.add("GET /" + canary + ".html HTTP/1.1");
                     String[] gadgets = gadgetSet.toArray(new String[0]);
-                    String[] clTechniques = {"vanilla", "nameprefix1", "spacejoin1", "0dsuffix"};
+                    // Pull all enabled CL.0 techniques (shared + CL + H1 permutations),
+                    // prioritizing the ones most commonly seen in findings.
+                    ArrayList<String> allClTechniques = allEnabledClTechniques();
+                    publish("Sweep will try " + allClTechniques.size() + " enabled CL.0 technique(s).");
 
                     int attemptsPerCombo = SINGLE_CONNECTION_ATTEMPTS;
                     int comboCount = 0;
@@ -847,8 +911,8 @@ final class DesyncAgentDialog {
                         if (stopRequested()) {
                             return stoppedByUserMessage("auto-sweep");
                         }
-                        String[] techniques = type == DesyncRepro.Type.CL_0
-                                ? clTechniques : new String[]{"vanilla"};
+                        List<String> techniques = type == DesyncRepro.Type.CL_0
+                                ? allClTechniques : java.util.Collections.singletonList("vanilla");
                         for (String technique : techniques) {
                             if (stopRequested()) {
                                 return stoppedByUserMessage("auto-sweep");
@@ -885,9 +949,10 @@ final class DesyncAgentDialog {
                                     if (stopRequested()) {
                                         return stoppedByUserMessage("auto-sweep");
                                     }
+                                    byte[] bustedFollow = Utilities.addCacheBuster(candidate.followUpRequest, null);
                                     TurboHelper helper = new TurboHelper(svc, true);
                                     helper.queue(attackBytes);
-                                    helper.queue(candidate.followUpRequest);
+                                    helper.queue(bustedFollow);
                                     List<Resp> results = helper.waitFor();
                                     int conns = helper.getConnectionCount();
                                     if (results == null || results.size() < 2 || results.get(1) == null
@@ -915,9 +980,10 @@ final class DesyncAgentDialog {
                                         if (stopRequested()) {
                                             return stoppedByUserMessage("auto-sweep");
                                         }
+                                        byte[] bustedFollow = Utilities.addCacheBuster(candidate.followUpRequest, null);
                                         TurboHelper helper = new TurboHelper(svc, true);
                                         helper.queue(attackBytes);
-                                        helper.queue(candidate.followUpRequest);
+                                        helper.queue(bustedFollow);
                                         List<Resp> results = helper.waitFor();
                                         int conns = helper.getConnectionCount();
                                         if (results == null || results.size() < 2 || results.get(1) == null
@@ -1082,7 +1148,8 @@ final class DesyncAgentDialog {
     private static Resp tryBaseline(IHttpService svc, byte[] followBytes) {
         for (int i = 0; i < 2; i++) {
             try {
-                Resp r = new TurboHelper(svc, true).blockingRequest(followBytes);
+                byte[] busted = Utilities.addCacheBuster(followBytes, null);
+                Resp r = new TurboHelper(svc, true).blockingRequest(busted);
                 if (r != null && !r.failed() && r.getStatus() != 0) {
                     return r;
                 }
@@ -2157,6 +2224,30 @@ final class DesyncAgentDialog {
         return result;
     }
 
+    /**
+     * All enabled CL.0 techniques for the HTTP/1.1 auto-sweep. Unlike
+     * {@link #clZeroTechniquesOrdered} (used for H2 confirmation, which excludes H1),
+     * this includes shared, CL, and H1 permutations — everything that
+     * {@link DesyncBox#applyDesync} can apply to Content-Length on HTTP/1.1.
+     */
+    private static ArrayList<String> allEnabledClTechniques() {
+        LinkedHashSet<String> order = new LinkedHashSet<>();
+        String[] highPriority = {
+                "vanilla", "nameprefix1", "spacejoin1", "0dsuffix", "tabsuffix",
+                "CL-pad", "nameprefix2", "space1", "valueprefix1", "vertwrap", "nested",
+                "CL-plus", "CL-minus"
+        };
+        for (String p : highPriority) {
+            order.add(p);
+        }
+        order.addAll(DesyncBox.sharedPermutations.getSettings());
+        order.addAll(DesyncBox.clPermutations.getSettings());
+        order.addAll(DesyncBox.h1Permutations.getSettings());
+        // Filter out disabled techniques and non-boolean settings.
+        order.removeIf(t -> t == null || t.isEmpty() || !techniqueEnabled(t));
+        return new ArrayList<>(order);
+    }
+
     /** Safe technique-enabled check: getBoolean throws on non-boolean settings. */
     private static boolean techniqueEnabled(String technique) {
         try {
@@ -2166,7 +2257,12 @@ final class DesyncAgentDialog {
         }
     }
 
-    /** Two responses are "similar" if status matches and body sizes are close. */
+    /**
+     * Two responses are "similar" if they share the same status, comparable size,
+     * matching key headers (Content-Type, Location), and no dramatic body change.
+     * This catches subtle poisoning where status and size are close but the actual
+     * content is completely different (e.g. a different page at the same 200).
+     */
     private static boolean similar(Resp a, Resp b) {
         if (a == null || b == null) {
             return false;
@@ -2177,7 +2273,77 @@ final class DesyncAgentDialog {
         int la = respLen(a);
         int lb = respLen(b);
         int tolerance = Math.max(64, (int) (lb * 0.10));
-        return Math.abs(la - lb) <= tolerance;
+        if (Math.abs(la - lb) > tolerance) {
+            return false;
+        }
+        // Key header comparison: if these differ, the response is fundamentally different
+        // even when status and size look the same.
+        String ctA = respHeader(a, "Content-Type");
+        String ctB = respHeader(b, "Content-Type");
+        if (!ctA.isEmpty() && !ctB.isEmpty() && !headerValueSimilar(ctA, ctB)) {
+            return false;
+        }
+        String locA = respHeader(a, "Location");
+        String locB = respHeader(b, "Location");
+        if (!locA.equals(locB)) {
+            return false;
+        }
+        // Body snippet comparison: hash first 512 bytes of the body to detect
+        // cases where size is similar but content is completely swapped.
+        byte[] bodyA = respBodySnippet(a, 512);
+        byte[] bodyB = respBodySnippet(b, 512);
+        if (bodyA.length > 32 && bodyB.length > 32) {
+            int matching = 0;
+            int check = Math.min(bodyA.length, bodyB.length);
+            for (int i = 0; i < check; i++) {
+                if (bodyA[i] == bodyB[i]) matching++;
+            }
+            // Less than 50% byte-match on the leading body is a different page.
+            if (matching < check / 2) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String respHeader(Resp r, String name) {
+        try {
+            byte[] raw = r == null ? null : r.getResponse();
+            if (raw == null) return "";
+            String headers = Utilities.getHeaders(raw);
+            String lower = headers.toLowerCase();
+            String needle = "\n" + name.toLowerCase() + ":";
+            int idx = lower.indexOf(needle);
+            if (idx < 0) return "";
+            int start = idx + needle.length();
+            int end = lower.indexOf('\n', start);
+            return (end < 0 ? headers.substring(start) : headers.substring(start, end)).trim();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static boolean headerValueSimilar(String a, String b) {
+        // Compare the primary MIME type (before ';' parameters like charset).
+        String baseA = a.contains(";") ? a.substring(0, a.indexOf(';')).trim() : a.trim();
+        String baseB = b.contains(";") ? b.substring(0, b.indexOf(';')).trim() : b.trim();
+        return baseA.equalsIgnoreCase(baseB);
+    }
+
+    private static byte[] respBodySnippet(Resp r, int max) {
+        try {
+            byte[] raw = r == null ? null : r.getResponse();
+            if (raw == null) return new byte[0];
+            String headers = Utilities.getHeaders(raw);
+            int bodyStart = headers.length();
+            if (bodyStart >= raw.length) return new byte[0];
+            int len = Math.min(max, raw.length - bodyStart);
+            byte[] snippet = new byte[len];
+            System.arraycopy(raw, bodyStart, snippet, 0, len);
+            return snippet;
+        } catch (Throwable t) {
+            return new byte[0];
+        }
     }
 
     private static int respLen(Resp r) {
