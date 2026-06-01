@@ -1,0 +1,29 @@
+package burp;
+
+import java.util.Arrays;
+import java.util.List;
+
+public class HTTP2Method extends Scan {
+
+    HTTP2Method(String name) {
+        super(name);
+    }
+
+    List<IScanIssue> doScan(byte[] baseReq, IHttpService service) {
+        String path = Utilities.getPathFromRequest(baseReq);
+        String collab = Utilities.globalSettings.getString("collab-domain");
+        byte[] attack;
+
+        if (HTTP2Scan.shouldSkipForFP(service)) {
+            return null;
+        }
+
+        attack = Utilities.addOrReplaceHeader(baseReq, ":method", "GET http://"+collab+path +" HTTP/1.1");
+        Resp resp = HTTP2Scan.h2request(service, attack);
+        if (Utilities.contains(resp, collab)) {
+            report("Method path reflection v2", "", resp);
+        }
+
+        return null;
+    }
+}

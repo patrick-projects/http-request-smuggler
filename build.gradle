@@ -1,0 +1,122 @@
+plugins {
+    id 'java-library'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    // Required local PortSwigger dependency JARs. The Turbo Intruder JAR is
+    // shipped under different filenames depending on how it is built, so both
+    // turbo-intruder.jar and turbo-intruder-all.jar are accepted at the
+    // project root.
+    bulkScanJar = file('bulkScan-all.jar')
+    turboIntruderCandidates = ['turbo-intruder.jar', 'turbo-intruder-all.jar']
+            .collect { file(it) }
+    turboIntruderJar = turboIntruderCandidates.find { it.exists() } ?: turboIntruderCandidates.first()
+}
+
+dependencies {
+    implementation 'org.apache.commons:commons-lang3:3.14.0'
+    implementation 'org.apache.commons:commons-collections4:4.4'
+    implementation files(bulkScanJar) // PortSwigger BulkScan framework (provides albinowaxUtils and Burp APIs)
+    implementation files(turboIntruderJar) // PortSwigger Turbo Intruder runtime (provides albinowaxUtils and Burp APIs)
+
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+sourceSets {
+    main {
+        java {
+            srcDir 'src'
+            exclude 'test/**'
+        }
+        resources {
+            srcDir 'resources'
+        }
+    }
+    test {
+        java {
+            // Tests live under src/test/java; we additionally pull in the pure
+            // helpers from src/burp/ that have no PortSwigger dependency so
+            // they can be exercised by unit tests without the closed-source
+            // jars on the classpath. Add new entries to the include list when
+            // introducing a new pure helper that needs coverage.
+            srcDirs = ['src/test/java', 'src']
+            include 'burp/*Test.java'
+            include 'burp/SmuggleTargetScorer.java'
+            exclude 'burp/ContaminationTest.java'
+        }
+        resources {
+            srcDir 'src/test/resources'
+        }
+        // Tests are intentionally independent of the main source set so they
+        // can compile and run in CI without the local PortSwigger dependency
+        // JARs (bulkScan-all.jar / turbo-intruder.jar) being present. The main
+        // resources directory is exposed so tests can verify packaged exploit
+        // templates and other shipped assets.
+        compileClasspath = configurations.testCompileClasspath
+        runtimeClasspath = output + configurations.testRuntimeClasspath + files('resources')
+    }
+}
+
+base {
+    archivesName = 'desynchronize-all'
+}
+
+tasks.register('checkLocalDependencies') {
+    description = 'Validates that required local PortSwigger dependency JARs are present.'
+    group = 'verification'
+
+    doLast {
+        def missing = []
+        if (!bulkScanJar.exists()) {
+            missing << '  - bulkScan-all.jar (provides BulkScan, Utilities, Scan framework)'
+        }
+        if (!turboIntruderJar.exists()) {
+            missing << '  - turbo-intruder.jar or turbo-intruder-all.jar (Turbo Intruder + Burp APIs)'
+        }
+
+        if (!missing.isEmpty()) {
+            throw new GradleException(
+                    'Missing required local dependency JARs:\n' +
+                            missing.join('\n') + '\n\n' +
+                            'Place these JARs at the project root before building the fat JAR.\n' +
+                            'See README.md ("Compile" section) for sourcing instructions.\n' +
+                            'Tip: `./gradlew test` runs without these JARs.'
+            )
+        }
+    }
+}
+
+tasks.named('compileJava') {
+    dependsOn 'checkLocalDependencies'
+}
+
+tasks.register('fatJar', Jar) {
+    description = 'Builds the BApp fat JAR (desynchronize-all.jar) for Burp Suite.'
+    group = 'build'
+    dependsOn 'checkLocalDependencies'
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    from {
+        configurations.compileClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    with jar
+}
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat 'full'
+    }
+}

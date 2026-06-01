@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      run-fatjar:
+        description: "Build the BApp fat JAR (requires local PortSwigger dependency JARs uploaded as a workflow secret/artifact)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-wrapper:
+    name: Validate Gradle Wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v3
+
+  test:
+    name: Tests (no PortSwigger JARs required)
+    runs-on: ubuntu-latest
+    needs: validate-wrapper
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
+
+      - name: Run independent test suite
+        run: ./gradlew --no-daemon test
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            build/reports/tests/test
+            build/test-results/test
+          if-no-files-found: ignore
+
+  fatjar:
+    name: Build BApp fat JAR
+    runs-on: ubuntu-latest
+    needs: test
+    # Only attempt the packaging step when the dispatcher explicitly opts in,
+    # because building requires the PortSwigger bulkScan-all.jar and
+    # turbo-intruder.jar artifacts which are not redistributable through this
+    # repository. Forks contributing changes can iterate on `test` alone.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run-fatjar }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Verify local dependency JARs are present
+        run: |
+          missing=0
+          if [ ! -f bulkScan-all.jar ]; then
+            echo "::error::bulkScan-all.jar is not present at the repository root"
+            missing=1
+          fi
+          if [ ! -f turbo-intruder.jar ] && [ ! -f turbo-intruder-all.jar ]; then
+            echo "::error::Neither turbo-intruder.jar nor turbo-intruder-all.jar is present at the repository root"
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Provide the PortSwigger dependency JARs via a prior workflow step (artifact download, secret, etc.) before running the fatJar job."
+            exit 1
+          fi
+
+      - name: Build fat JAR
+        run: ./gradlew --no-daemon fatJar
+
+      - name: Upload fat JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: desynchronize-all
+          path: build/libs/desynchronize-all*.jar
+          if-no-files-found: error

@@ -1,0 +1,9 @@
+.gradle/
+build/
+.idea/
+.jdk/
+
+# PortSwigger build dependencies (not redistributable; see README)
+bulkScan-all.jar
+turbo-intruder.jar
+turbo-intruder-all.jar
