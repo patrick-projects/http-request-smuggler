@@ -778,12 +778,27 @@ final class DesyncAgentDialog {
                             verdict.append(truncate(respString(evidence), 1200));
                         }
                     } else {
-                        verdict.append("NOT OBSERVED in ").append(totalSingleConn)
-                                .append(" single-connection attempts.\n")
-                                .append("The follow-up response never changed. The target may not be\n")
-                                .append("vulnerable to ").append(label).append(", or it needs a different smuggled\n")
-                                .append("request/technique. Try editing the smuggled request line, or another\n")
-                                .append("desync type from the drop-down.\n");
+                        // TurboHelper pair approach didn't trigger it. Fall back to the
+                        // scanner's own self-poison loop — the exact same code that found
+                        // the issue originally. This handles HTTP/2-only targets and cases
+                        // where Burp's HTTP engine connection reuse behaves differently
+                        // from TurboHelper's raw socket.
+                        verdict.append("NOT OBSERVED via single-connection pairs (").append(totalSingleConn)
+                                .append(" attempts).\n")
+                                .append("Falling back to scanner-style self-poison detection...\n");
+                        publish(verdict.toString());
+
+                        String scannerResult = runScannerStyleFallback(
+                                svc, workingRequest.clone(), userSmuggledLine, this::publish);
+                        if (scannerResult != null) {
+                            return scannerResult;
+                        }
+                        return "\n========================================\n"
+                                + "NOT CONFIRMED by either method.\n"
+                                + "The follow-up response never changed, and the scanner-style\n"
+                                + "self-poison loop also did not trigger. The target may not be\n"
+                                + "vulnerable to " + label + " with this request, or it needs a\n"
+                                + "different smuggled request/technique. Try auto-sweep.\n";
                     }
                     return verdict.toString();
                 } catch (Throwable t) {
@@ -1031,11 +1046,30 @@ final class DesyncAgentDialog {
                             }
                         }
                     }
+                    // TurboHelper pair approach didn't work for any combo.
+                    // Fall back to the scanner's own detection as a last resort.
+                    publish("\n========================================\n"
+                            + "NOT CONFIRMED after " + comboCount + " combinations via pair approach.\n"
+                            + "Falling back to scanner-style self-poison detection...");
+
+                    String scannerResult = runScannerStyleFallback(
+                            svc, reqSnapshot.clone(), userSmuggledLine, this::publish);
+                    if (scannerResult != null) {
+                        return scannerResult;
+                    }
+
+                    // Final fallback: try the full H2 confirmation path if it looks HTTP/2-capable.
+                    if (originalReachable(svc) && isLikelyH2Only(svc)) {
+                        publish("\nScanner fallback didn't find it either. Trying full HTTP/2 "
+                                + "technique sweep...");
+                        return runH2Confirmation(svc, reqSnapshot, initialTechnique,
+                                userSmuggledLine, this::publish);
+                    }
+
                     return "\n========================================\n"
-                            + "NOT CONFIRMED after " + comboCount + " combinations.\n"
-                            + "No tried type/gadget/technique poisoned the follow-up. The target may not be\n"
-                            + "vulnerable to an HTTP/1.1 desync here, may need HTTP/2, or may require a\n"
-                            + "hand-crafted smuggled request. The session may also be invalid (validate it).";
+                            + "NOT CONFIRMED after " + comboCount + " TurboHelper combos + scanner fallback.\n"
+                            + "The session may be invalid (validate it), or the desync may be\n"
+                            + "intermittent/environment-specific.";
                 } catch (Throwable t) {
                     String detail = t.getMessage() == null ? t.toString() : t.getMessage();
                     return "\nAuto-sweep failed: " + detail;
@@ -1176,6 +1210,18 @@ final class DesyncAgentDialog {
                 + "may be invalid. Use \"Validate session\" above to check, then retry.";
     }
 
+    /** True if HTTP/1.1 baseline fails but the original request works — likely HTTP/2-only. */
+    private boolean isLikelyH2Only(IHttpService svc) {
+        try {
+            if (tryBaseline(svc, buildPlainFollowUp(workingRequest)) == null) {
+                return originalReachable(svc);
+            }
+        } catch (Throwable ignored) {
+            // fall through
+        }
+        return false;
+    }
+
     /** True if the original captured request still gets a valid response (e.g. over HTTP/2). */
     private boolean originalReachable(IHttpService svc) {
         try {
@@ -1184,6 +1230,71 @@ final class DesyncAgentDialog {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    /**
+     * Runs the scanner's own self-poison detection ({@link ImplicitZeroScan#doConfiguredScan})
+     * as a fallback when the TurboHelper pair approach fails. This uses the exact same detection
+     * code that found the issue during the original scan: send the same attack N times via Burp's
+     * HTTP engine (which handles HTTP/2, connection reuse, etc. natively) and check if the
+     * response to attempt N looks like the smuggled gadget from attempt N-1.
+     *
+     * <p>Tries the technique from the current PoC first, then a handful of common ones.
+     * Returns a verdict string on success, or null if nothing confirmed.</p>
+     */
+    private String runScannerStyleFallback(IHttpService svc, byte[] reqSnapshot,
+                                           String preferredSmuggledLine,
+                                           java.util.function.Consumer<String> publish) {
+        String gadgetLine = (preferredSmuggledLine == null || preferredSmuggledLine.trim().isEmpty())
+                ? DesyncRepro.DEFAULT_SMUGGLED_LINE : preferredSmuggledLine.trim();
+        String currentTechnique = repro != null ? repro.technique : "vanilla";
+
+        LinkedHashSet<String> toTry = new LinkedHashSet<>();
+        if (currentTechnique != null && !currentTechnique.isEmpty()) {
+            toTry.add(currentTechnique);
+        }
+        if (initialTechnique != null && !initialTechnique.isEmpty()) {
+            toTry.add(initialTechnique);
+        }
+        toTry.add("vanilla");
+        toTry.add("tabsuffix");
+        toTry.add("CL-pad");
+        toTry.add("nameprefix1");
+        toTry.add("spacejoin1");
+
+        publish.accept("\nScanner fallback: trying " + toTry.size() + " techniques via Burp's HTTP engine "
+                + "(same code as the original scan)...");
+
+        for (String technique : toTry) {
+            if (stopRequested()) return stoppedByUserMessage("scanner fallback");
+            if (!techniqueEnabled(technique)) continue;
+            publish.accept("  Scanner-style: technique '" + technique + "' with '" + gadgetLine + "'...");
+            try {
+                ImplicitZeroScan scan = new ImplicitZeroScan("CL.0 (agent fallback)");
+                HashMap<String, Boolean> cfg = new HashMap<>();
+                cfg.put(technique, true);
+                boolean hit = scan.doConfiguredScan(reqSnapshot.clone(), svc, cfg, gadgetLine);
+                if (hit) {
+                    String repeaterNote = loadAndSendConfirmed(scan);
+                    return "\n========================================\n"
+                            + "DESYNC CONFIRMED via scanner fallback using technique '" + technique + "'"
+                            + (scan.lastConfirmedGadget != null
+                            ? " (smuggled: " + scan.lastConfirmedGadget + ")" : "") + ".\n"
+                            + "The scanner's self-poison loop detected the desync"
+                            + (scan.lastConfirmedOverH2 ? " over HTTP/2" : "") + ".\n\n"
+                            + "Note: this was caught by Burp's HTTP engine, not the TurboHelper\n"
+                            + "pair approach. This usually means the target needs HTTP/2 or the\n"
+                            + "desync only manifests with Burp's connection reuse pattern.\n\n"
+                            + "A finding has been filed in Burp (Dashboard / Organizer / Issues).\n"
+                            + repeaterNote;
+                }
+                publish.accept("    (no hit with '" + technique + "')");
+            } catch (Throwable t) {
+                publish.accept("    (" + technique + " errored: "
+                        + (t.getMessage() == null ? t.toString() : t.getMessage()) + ")");
+            }
+        }
+        return null;
     }
 
     /**
